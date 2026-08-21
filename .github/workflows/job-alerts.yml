@@ -1,0 +1,37 @@
+name: Job Alerts
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub may delay scheduled runs a few minutes
+    # during high load -- that's normal and not something to fix.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+  # ^ lets you manually trigger a run from the Actions tab, useful for testing
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run poller
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_TO: "gowthamchowdam2001@gmail.com"
+        run: python poller.py
+
+      - name: Commit updated seen-jobs state
+        run: |
+          git config user.name "job-alert-bot"
+          git config user.email "actions@github.com"
+          git add seen_jobs.json
+          git diff --quiet --cached || git commit -m "Update seen jobs state"
+          git push
