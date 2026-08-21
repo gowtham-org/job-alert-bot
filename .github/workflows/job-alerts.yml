@@ -2,9 +2,12 @@ name: Job Alerts
 
 on:
   schedule:
-    # Every 30 minutes. GitHub may delay scheduled runs a few minutes
-    # during high load -- that's normal and not something to fix.
-    - cron: "*/30 * * * *"
+    # Every 15 minutes -- as close to "immediate" as a scheduled job can
+    # reliably get. GitHub may delay scheduled runs a few extra minutes
+    # during high load; that's normal and not something to fix. Since
+    # the repo is public, Actions minutes are free/unlimited, so this is
+    # safe to run at this frequency.
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
   # ^ lets you manually trigger a run from the Actions tab, useful for testing
 
