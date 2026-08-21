@@ -7,13 +7,21 @@ aggregator API. Pipeline for each posting:
 
   1. Title matches a DevOps/SRE/Cloud/Platform/Infra/MLOps/AIOps keyword
   2. Location looks US-based
-  3. Full job description does NOT contain any excluded citizenship /
+  3. Posting is not older than MAX_POSTING_AGE_HOURS (based on the ATS's own
+     posted/updated date field, when available)
+  4. Full job description does NOT contain any excluded citizenship /
      clearance / export-control phrase
-  4. Full job description does not ask for more than MAX_YEARS_EXPERIENCE
-  5. Not already emailed in a previous run (tracked in seen_jobs.json)
+  5. Full job description does not ask for more than MAX_YEARS_EXPERIENCE
+  6. Not already emailed in a previous run (tracked in seen_jobs.json)
 
-Steps 3-4 require fetching each job's full description, which is only
-done for postings that already passed steps 1-2, to keep the number of
+Step 3 matters because "new to the bot" (never-before-seen job ID) is not
+the same thing as "recently posted" -- e.g. the first time a company is
+added or a broken token gets fixed, every currently-open posting on that
+board looks brand new to seen_jobs.json even if it's been live for months.
+The age check catches that.
+
+Steps 4-5 require fetching each job's full description, which is only
+done for postings that already passed steps 1-3, to keep the number of
 extra requests small.
 
 Run via GitHub Actions on a schedule. seen_jobs.json is committed back to
@@ -35,6 +43,20 @@ from companies import COMPANIES
 
 TIMEOUT = 15
 MAX_YEARS_EXPERIENCE = 4
+MAX_POSTING_AGE_HOURS = 0.50
+# Postings older than this (by the ATS's own posted/updated date, when we
+# can determine it) are dropped even if their ID is new to seen_jobs.json.
+# When a posting's age can't be determined at all, it's kept rather than
+# guessed away -- see is_recent_enough() below.
+#
+# IMPORTANT LIMITATION: Workday only reports day-level granularity
+# ("Posted Today", "Posted 3 Days Ago"), never hours or minutes. A Workday
+# posting from 20 hours ago and one from 5 minutes ago both show as
+# "Posted Today" and will both pass a 2-hour filter -- there's no way to
+# tell them apart with the data Workday exposes. This only affects the 2
+# Workday companies in companies.py (Adobe, Target); every other platform
+# (Greenhouse, Lever, Ashby, SmartRecruiters, Remotive) gives exact
+# timestamps and this filter works precisely for those.
 STATE_FILE = Path(__file__).parent / "seen_jobs.json"
 
 KEYWORDS = [
@@ -121,6 +143,56 @@ def matches_keywords(title: str) -> bool:
     return any(k in t for k in KEYWORDS)
 
 
+# --- Posting age / recency -------------------------------------------------
+# Each ATS reports "when was this posted" differently. These helpers
+# normalize whatever's available into a UTC datetime, or None if it can't
+# be determined -- in which case the posting is kept rather than guessed
+# away (see is_recent_enough).
+
+def _parse_iso(value) -> "datetime.datetime | None":
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _parse_epoch_ms(value) -> "datetime.datetime | None":
+    if value is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(int(value) / 1000, tz=datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def _parse_workday_relative(text) -> "datetime.datetime | None":
+    # Workday search results give relative text like "Posted Today",
+    # "Posted 3 Days Ago", or "Posted 30+ Days Ago" instead of a real date.
+    # This is inherently approximate -- "30+" is treated as exactly 30,
+    # which is a floor, not the true age.
+    if not text:
+        return None
+    t = text.lower()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if "today" in t:
+        return now
+    if "yesterday" in t:
+        return now - datetime.timedelta(days=1)
+    m = re.search(r"(\d+)\+?\s*day", t)
+    if m:
+        return now - datetime.timedelta(days=int(m.group(1)))
+    return None
+
+
+def is_recent_enough(posted_dt, max_age_hours: int = MAX_POSTING_AGE_HOURS) -> bool:
+    if posted_dt is None:
+        return True  # unknown age -- don't hide it, can't verify
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=max_age_hours)
+    return posted_dt >= cutoff
+
+
 # --- Citizenship / clearance / export-control exclusion --------------------
 # Word-boundary patterns for short acronyms (avoids false hits like "year"
 # matching "ear"), substring patterns for longer phrases.
@@ -201,6 +273,7 @@ def fetch_greenhouse(token: str):
                 "title": j.get("title", ""),
                 "location": (j.get("location") or {}).get("name", ""),
                 "url": j.get("absolute_url", ""),
+                "posted_dt": _parse_iso(j.get("first_published") or j.get("updated_at")),
                 "_desc_kind": "greenhouse",
                 "_desc_ref": (token, j["id"]),
             }
@@ -230,6 +303,7 @@ def fetch_lever(token: str):
                 "title": j.get("text", ""),
                 "location": (j.get("categories") or {}).get("location", ""),
                 "url": j.get("hostedUrl", ""),
+                "posted_dt": _parse_epoch_ms(j.get("createdAt")),
                 "_desc_kind": "inline",
                 "_desc_text": full_desc,
             }
@@ -249,6 +323,7 @@ def fetch_ashby(token: str):
                 "title": j.get("title", ""),
                 "location": j.get("location") or j.get("locationName", "") or "",
                 "url": j.get("jobUrl") or j.get("applyUrl", ""),
+                "posted_dt": _parse_iso(j.get("publishedAt")),
                 "_desc_kind": "inline",
                 "_desc_text": desc,
             }
@@ -269,6 +344,7 @@ def fetch_smartrecruiters(company: str):
                 "title": j.get("name", ""),
                 "location": loc_str,
                 "url": f"https://jobs.smartrecruiters.com/{company}/{j.get('id')}",
+                "posted_dt": _parse_iso(j.get("releasedDate")),
                 "_desc_kind": "smartrecruiters",
                 "_desc_ref": (company, j.get("id")),
             }
@@ -302,6 +378,7 @@ def fetch_workday(cfg: dict):
                 "title": j.get("title", ""),
                 "location": j.get("locationsText", ""),
                 "url": f"https://{tenant}.{dc}.myworkdayjobs.com/{site}{path}",
+                "posted_dt": _parse_workday_relative(j.get("postedOn")),
                 "_desc_kind": "workday",
                 "_desc_ref": (tenant, dc, site, path),
             }
@@ -360,6 +437,7 @@ def fetch_remotive():
                     "location": j.get("candidate_required_location", ""),
                     "url": j.get("url", ""),
                     "company": j.get("company_name", ""),
+                    "posted_dt": _parse_iso(j.get("publication_date")),
                     "_desc_kind": "inline",
                     "_desc_text": strip_html(j.get("description", "")),
                 }
@@ -467,10 +545,13 @@ def main() -> None:
         for f in failed:
             print(f"  - {f}")
 
-    # Pass 1: cheap filters using only title + location, no extra requests.
+    # Pass 1: cheap filters using only title + location + posted date --
+    # no extra network requests needed for any of these.
     stage1 = [
         j for j in all_jobs
-        if matches_keywords(j["title"]) and is_us_location(j.get("location", ""))
+        if matches_keywords(j["title"])
+        and is_us_location(j.get("location", ""))
+        and is_recent_enough(j.get("posted_dt"))
     ]
 
     # Only fetch descriptions for jobs already flagged as new (skip the
@@ -493,7 +574,8 @@ def main() -> None:
 
     print(
         f"Checked {len(COMPANIES)} companies + Remotive. "
-        f"{len(stage1)} matched keyword+US location, {len(to_check)} were new, "
+        f"{len(stage1)} matched keyword+US location+within {MAX_POSTING_AGE_HOURS}h, "
+        f"{len(to_check)} were new, "
         f"{excluded_citizenship} dropped for citizenship/clearance terms, "
         f"{excluded_experience} dropped for exceeding {MAX_YEARS_EXPERIENCE}+ years experience, "
         f"{len(final_jobs)} passed everything and will be emailed."
