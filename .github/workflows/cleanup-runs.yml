@@ -1,0 +1,46 @@
+name: Cleanup Old Workflow Runs
+
+# Runs once a day and deletes workflow run history (for ALL workflows in
+# this repo, including this cleanup job's own past runs) older than
+# RETENTION_DAYS. This does NOT affect the bot's actual functionality --
+# seen_jobs.json and the emails you've already received are untouched.
+# This only trims the run logs visible in the Actions tab.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # once daily at 3 AM UTC
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+
+env:
+  RETENTION_DAYS: 7
+  # How many days of run history to keep. At ~96 runs/day for job-alerts.yml,
+  # 7 days keeps roughly the last ~670 runs visible -- plenty for recent
+  # debugging without accumulating forever. Raise or lower as you like.
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+          CUTOFF=$(date -u -d "${RETENTION_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deleting runs older than $CUTOFF in $REPO"
+
+          gh run list --repo "$REPO" --limit 1000 --json databaseId,createdAt \
+            --jq --arg cutoff "$CUTOFF" '.[] | select(.createdAt < $cutoff) | .databaseId' \
+            > /tmp/old_run_ids.txt
+
+          COUNT=$(wc -l < /tmp/old_run_ids.txt)
+          echo "Found $COUNT run(s) to delete."
+
+          while read -r id; do
+            [ -z "$id" ] && continue
+            echo "Deleting run $id"
+            gh run delete "$id" --repo "$REPO" || echo "  (failed, skipping)"
+          done < /tmp/old_run_ids.txt
