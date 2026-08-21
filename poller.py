@@ -20,6 +20,7 @@ Run via GitHub Actions on a schedule. seen_jobs.json is committed back to
 the repo after each run so state persists between runs.
 """
 
+import datetime
 import json
 import os
 import re
@@ -366,14 +367,43 @@ def fetch_remotive():
     return jobs
 
 
-def load_seen() -> set:
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return set()
+SEEN_RETENTION_DAYS = 60
+# How long a job ID stays remembered before it's eligible to be pruned from
+# seen_jobs.json. A posting that's been gone from a company's board for this
+# long is no longer at any real risk of reappearing with the same ID, so
+# there's no downside to letting it drop off -- this just keeps the file
+# from growing forever.
 
 
-def save_seen(seen: set) -> None:
-    STATE_FILE.write_text(json.dumps(sorted(seen)))
+def load_seen() -> dict:
+    """Returns {job_id: iso_timestamp_first_seen}. Transparently upgrades
+    the old flat-list format (from before retention was added) by treating
+    every existing ID as 'seen right now'."""
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+    if isinstance(data, list):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return {job_id: now for job_id in data}
+    return data
+
+
+def save_seen(seen: dict) -> None:
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=SEEN_RETENTION_DAYS)
+    pruned = {}
+    for job_id, ts in seen.items():
+        try:
+            when = datetime.datetime.fromisoformat(ts)
+        except Exception:
+            # Unparsable timestamp -- keep it rather than risk losing state.
+            pruned[job_id] = ts
+            continue
+        if when >= cutoff:
+            pruned[job_id] = ts
+    STATE_FILE.write_text(json.dumps(pruned, sort_keys=True))
 
 
 def send_email(new_jobs) -> None:
@@ -473,8 +503,11 @@ def main() -> None:
         send_email(final_jobs)
 
     # Mark everything we evaluated as seen, whether it passed or was
-    # excluded, so we don't re-fetch/re-check it every run.
-    seen.update(j["id"] for j in to_check)
+    # excluded, so we don't re-fetch/re-check it every run. save_seen()
+    # also prunes anything older than SEEN_RETENTION_DAYS.
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    for j in to_check:
+        seen[j["id"]] = now_iso
     save_seen(seen)
 
 
