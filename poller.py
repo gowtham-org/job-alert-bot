@@ -43,7 +43,7 @@ from companies import COMPANIES
 
 TIMEOUT = 15
 MAX_YEARS_EXPERIENCE = 4
-MAX_POSTING_AGE_HOURS = 0.50
+MAX_POSTING_AGE_HOURS = 2
 # Postings older than this (by the ATS's own posted/updated date, when we
 # can determine it) are dropped even if their ID is new to seen_jobs.json.
 # When a posting's age can't be determined at all, it's kept rather than
@@ -153,9 +153,17 @@ def _parse_iso(value) -> "datetime.datetime | None":
     if not value:
         return None
     try:
-        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        dt = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except Exception:
         return None
+    if dt.tzinfo is None:
+        # Some ATSs (seen on certain Greenhouse/SmartRecruiters postings)
+        # omit the timezone offset entirely, e.g. "2026-08-21T10:00:00"
+        # instead of "...T10:00:00Z". Treat those as UTC rather than
+        # leaving them "naive", which would crash the comparison in
+        # is_recent_enough() against an explicitly-aware cutoff.
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
 
 
 def _parse_epoch_ms(value) -> "datetime.datetime | None":
@@ -189,6 +197,12 @@ def _parse_workday_relative(text) -> "datetime.datetime | None":
 def is_recent_enough(posted_dt, max_age_hours: int = MAX_POSTING_AGE_HOURS) -> bool:
     if posted_dt is None:
         return True  # unknown age -- don't hide it, can't verify
+    if posted_dt.tzinfo is None:
+        # Defensive: normalize here too, in case any future date source
+        # ever slips through _parse_iso() as naive. Comparing naive vs
+        # aware datetimes raises TypeError, which would crash the whole
+        # run -- this guarantees that can't happen regardless of source.
+        posted_dt = posted_dt.replace(tzinfo=datetime.timezone.utc)
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=max_age_hours)
     return posted_dt >= cutoff
 
